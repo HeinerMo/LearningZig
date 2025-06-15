@@ -25,10 +25,10 @@ pub fn main() !void {
     try posix.bind(listener, &address.any, address.getOsSockLen());
     try posix.listen(listener, 128); //the 128 represents the max number of pending connections the socket can queue.
 
+    var buf: [128]u8 = undefined;
     while (true) {
         var client_address: net.Address = undefined;
         var client_address_len: posix.socklen_t = @sizeOf(net.Address);
-
         const socket = posix.accept(listener, &client_address.any, &client_address_len, 0) catch |err| {
             // Rare that this happens, but in later parts we'll
             // see examples where it does.
@@ -39,7 +39,28 @@ pub fn main() !void {
 
         std.debug.print("{} connected\n", .{client_address});
 
-        write(socket, "Hello (and goodbye)") catch |err| {
+        //set Read timeout to 2.5 seconds
+        const timeout = posix.timeval{ .sec = 2, .usec = 500_000 };
+        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
+
+        // add the write timeout
+        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
+
+        const read = posix.read(socket, &buf) catch |err| {
+            std.debug.print("error reading: {}\n", .{err});
+            continue;
+        };
+
+        //The following comments show how to perform the read and write using the Zig's Standard Library. However, it is best to use the sockets directly.
+        //const stream = std.net.Stream{.handle = socket};
+        //const read = try stream.read(&buf);
+        //try stream.writeAll(buf[0..read]);
+
+        if (read == 0) {
+            continue;
+        }
+
+        write(socket, buf[0..read]) catch |err| {
             // This can easily happen, say if the client disconnects.
             std.debug.print("error writing: {}\n", .{err});
         };
