@@ -1,112 +1,270 @@
 const std = @import("std");
 const net = std.net;
 const posix = std.posix;
+const Allocator = std.mem.Allocator;
+
+const log = std.log.scoped(.tcp_demo);
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    var server = try Server.init(allocator, 4096);
+    defer server.deinit();
+
     const address = try std.net.Address.parseIp("127.0.0.1", 5882);
+    try server.run(address);
+}
 
-    const tpe: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
-    const protocol = posix.IPPROTO.TCP;
-    const listener = try posix.socket(address.any.family, tpe, protocol);
-    defer posix.close(listener);
+const Server = struct {
+    // creates our polls and clients slices and is passed to Client.init
+    // for it to create our read buffer.
+    allocator: Allocator,
 
-    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    try posix.listen(listener, 128);
+    // The number of clients we currently have connected
+    connected: usize,
 
-    // Our server can support 4095 clients. Wait, shouldn't that be 4096? No
-    // One of the polling slots (the first one) is reserved for our listening
-    // socket.
+    // polls[0] is always our listening socket
+    polls: []posix.pollfd,
 
-    var polls: [4096]posix.pollfd = undefined;
-    polls[0] = .{
-        .fd = listener,
-        .events = posix.POLL.IN,
-        .revents = 0,
-    };
-    var poll_count: usize = 1;
+    // list of clients, only client[0..connected] are valid
+    clients: []Client,
 
-    while (true) {
-        // polls is the total number of connections we can monitor, but
-        // polls[0..poll_count + 1] is the actual number of clients + the listening
-        // socket that are currently connected (remember, the upper bound is exclusive)
-        var active = polls[0 .. poll_count + 1];
+    // This is always polls[1..] and it's used to so that we can manipulate
+    // clients and client_polls together. Necessary because polls[0] is the
+    // listening socket, and we don't ever touch that.
+    client_polls: []posix.pollfd,
 
-        // 2nd argument is the timeout, -1 is infinity
-        _ = try posix.poll(active, -1);
+    fn init(allocator: Allocator, max: usize) !Server {
+        // + 1 for the listening socket
+        const polls = try allocator.alloc(posix.pollfd, max + 1);
+        errdefer allocator.free(polls);
 
-        // Active[0] is _always_ the listening socket. When this socket is ready
-        // we can accept. Putting it outside the following while loop means that
-        // we don't have to check if if this is the listening socket on each
-        // iteration
-        if (active[0].revents != 0) {
-            // The listening socket is ready, accept!
-            // Notice that we pass SOCK.NONBLOCK to accept, placing the new client
-            // socket in non-blocking mode. Also, for now, for simplicity,
-            // we're not capturing the client address (the two null arguments).
-            const socket = try posix.accept(listener, null, null, posix.SOCK.NONBLOCK);
+        const clients = try allocator.alloc(Client, max);
+        errdefer allocator.free(clients);
 
-            // Add this new client socket to our polls array for monitoring
-            polls[poll_count] = .{
-                .fd = socket,
+        return .{
+            .polls = polls,
+            .clients = clients,
+            .client_polls = polls[1..],
+            .connected = 0,
+            .allocator = allocator,
+        };
+    }
 
-                // This will be SET by posix.poll to tell us what event is ready
-                // (or it will stay 0 if this socket isn't ready)
-                .revents = 0,
+    fn deinit(self: *Server) void {
+        // TODO: Close connected sockets? We'll talk about shutdowns in
+        // a future part.
+        self.allocator.free(self.polls);
+        self.allocator.free(self.clients);
+    }
 
-                // We want to be notified about the POLL.IN event
-                // (i.e. can read without blocking)
-                .events = posix.POLL.IN,
-            };
+    fn run(self: *Server, address: std.net.Address) !void {
+        const tpe: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK;
+        const protocol = posix.IPPROTO.TCP;
+        const listener = try posix.socket(address.any.family, tpe, protocol);
+        defer posix.close(listener);
 
-            // increment the number of active connections we're monitoring
-            // this can overflow our 4096 polls array. TODO: fix that!
-            poll_count += 1;
-        }
+        try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+        try posix.bind(listener, &address.any, address.getOsSockLen());
+        try posix.listen(listener, 128);
 
-        var i: usize = 1;
-        while (i < active.len) {
-            const polled = active[i];
+        // One of the polling slots (the first one) is reserved for our listening
+        // socket.
+        self.polls[0] = .{
+            .fd = listener,
+            .revents = 0,
+            .events = posix.POLL.IN,
+        };
 
-            const revents = polled.revents;
-            if (revents == 0) {
-                // This socket isn't ready, go to the next one
-                i += 1;
-                continue;
+        while (true) {
+            // Oops, still have a +1 here, since we want to poll all our connected
+            // clients, plus our listening socket
+            _ = try posix.poll(self.polls[0 .. self.connected + 1], -1);
+
+            if (self.polls[0].revents != 0) {
+                // listening socket is ready
+                self.accept(listener) catch |err| log.err("failed to accept: {}", .{err});
             }
 
-            var closed = false;
-
-            // the socket is ready to be read
-            if (revents & posix.POLL.IN == posix.POLL.IN) {
-                var buf: [4096]u8 = undefined;
-                const read = posix.read(polled.fd, &buf) catch 0;
-                if (read == 0) {
-                    // probably closed on the other side
-                    closed = true;
-                } else {
-                    std.debug.print("[{d}] got: {any}\n", .{ polled.fd, buf[0..read] });
+            var i: usize = 0;
+            while (i < self.connected) {
+                const revents = self.client_polls[i].revents;
+                if (revents == 0) {
+                    // this socket isn't ready, move on to the next one
+                    i += 1;
+                    continue;
                 }
-            }
 
-            // either the read failed, or we're being notified through poll
-            // that the socket is closed
-            if (closed or (revents & posix.POLL.HUP == posix.POLL.HUP)) {
-                posix.close(polled.fd);
+                var client = &self.clients[i];
+                if (revents & posix.POLL.IN == posix.POLL.IN) {
+                    // this socket is ready to be read
+                    while (true) {
+                        const msg = client.readMessage() catch {
+                            // we don't increment `i` when we remove the client
+                            // because removeClient does a swap and puts the last
+                            // client at position i
+                            self.removeClient(i);
+                            break;
+                        } orelse {
+                            // no more messages, but this client is still connected
+                            i += 1;
+                            break;
+                        };
 
-                // We use a simple trick to remove it: we swap it with the last
-                // item in our array, then "shrink" our array by 1
-                const last_index = active.len - 1;
-                active[i] = active[last_index];
-                active = active[0..last_index];
-                poll_count -= 1;
-
-                // don't increment `i` because we swapped out the removed item
-                // and shrank the array
-            } else {
-                // not closed, go to the next socket
-                i += 1;
+                        std.debug.print("got: {s}\n", .{msg});
+                    }
+                }
             }
         }
     }
-}
+
+    fn accept(self: *Server, listener: posix.socket_t) !void {
+        while (true) {
+            var address: net.Address = undefined;
+            var address_len: posix.socklen_t = @sizeOf(net.Address);
+            const socket = posix.accept(listener, &address.any, &address_len, posix.SOCK.NONBLOCK) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return err,
+            };
+
+            const client = Client.init(self.allocator, socket, address) catch |err| {
+                posix.close(socket);
+                log.err("failed to initialize client: {}", .{err});
+                return;
+            };
+
+            const connected = self.connected;
+            self.clients[connected] = client;
+            self.client_polls[connected] = .{
+                .fd = socket,
+                .revents = 0,
+                .events = posix.POLL.IN,
+            };
+            self.connected = connected + 1;
+        }
+    }
+
+    fn removeClient(self: *Server, at: usize) void {
+        var client = self.clients[at];
+
+        posix.close(client.socket);
+        client.deinit(self.allocator);
+
+        // Swap the client we're removing with the last one
+        // So that when we set connected -= 1, it'll effectively "remove"
+        // the client from our slices.
+        const last_index = self.connected - 1;
+        self.clients[at] = self.clients[last_index];
+        self.client_polls[at] = self.client_polls[last_index];
+
+        self.connected = last_index;
+    }
+};
+
+const Client = struct {
+    reader: Reader,
+    socket: posix.socket_t,
+    address: std.net.Address,
+
+    fn init(allocator: Allocator, socket: posix.socket_t, address: std.net.Address) !Client {
+        const reader = try Reader.init(allocator, 4096);
+        errdefer reader.deinit(allocator);
+
+        return .{
+            .reader = reader,
+            .socket = socket,
+            .address = address,
+        };
+    }
+
+    fn deinit(self: *const Client, allocator: Allocator) void {
+        self.reader.deinit(allocator);
+    }
+
+    fn readMessage(self: *Client) !?[]const u8 {
+        return self.reader.readMessage(self.socket) catch |err| switch (err) {
+            error.WouldBlock => return null,
+            else => return err,
+        };
+    }
+};
+
+const Reader = struct {
+    buf: []u8,
+    pos: usize = 0,
+    start: usize = 0,
+
+    fn init(allocator: Allocator, size: usize) !Reader {
+        const buf = try allocator.alloc(u8, size);
+        return .{
+            .pos = 0,
+            .start = 0,
+            .buf = buf,
+        };
+    }
+
+    fn deinit(self: *const Reader, allocator: Allocator) void {
+        allocator.free(self.buf);
+    }
+
+    fn readMessage(self: *Reader, socket: posix.socket_t) ![]u8 {
+        var buf = self.buf;
+
+        while (true) {
+            if (try self.bufferedMessage()) |msg| {
+                return msg;
+            }
+            const pos = self.pos;
+            const n = try posix.read(socket, buf[pos..]);
+            if (n == 0) {
+                return error.Closed;
+            }
+            self.pos = pos + n;
+        }
+    }
+
+    fn bufferedMessage(self: *Reader) !?[]u8 {
+        const buf = self.buf;
+        const pos = self.pos;
+        const start = self.start;
+
+        std.debug.assert(pos >= start);
+        const unprocessed = buf[start..pos];
+        if (unprocessed.len < 4) {
+            self.ensureSpace(4 - unprocessed.len) catch unreachable;
+            return null;
+        }
+
+        const message_len = std.mem.readInt(u32, unprocessed[0..4], .little);
+
+        // the length of our message + the length of our prefix
+        const total_len = message_len + 4;
+
+        if (unprocessed.len < total_len) {
+            try self.ensureSpace(total_len);
+            return null;
+        }
+
+        self.start += total_len;
+        return unprocessed[4..total_len];
+    }
+
+    fn ensureSpace(self: *Reader, space: usize) error{BufferTooSmall}!void {
+        const buf = self.buf;
+        if (buf.len < space) {
+            return error.BufferTooSmall;
+        }
+
+        const start = self.start;
+        const spare = buf.len - start;
+        if (spare >= space) {
+            return;
+        }
+
+        const unprocessed = buf[start..self.pos];
+        std.mem.copyForwards(u8, buf[0..unprocessed.len], unprocessed);
+        self.start = 0;
+        self.pos = unprocessed.len;
+    }
+};
